@@ -1867,7 +1867,7 @@ def render_gjp_document_generator() -> None:
         "Responsibility/KSA output tables."
     )
     job_info_file = st.file_uploader(
-        "1) Upload job title/job code file political_affairs_job_info (.xlsx)",
+        "1) Upload job title/job code file (.xlsx)",
         type=["xlsx"],
         key="gjp_job_info_xlsx",
     )
