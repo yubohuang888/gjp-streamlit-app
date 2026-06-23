@@ -51,6 +51,12 @@ from openpyxl.worksheet.worksheet import Worksheet
 
 OUTPUT_LEVELS = ["P-1", "P-2", "P-3", "P-4", "P-5", "D-1", "NO-A", "NO-B", "NO-C", "NO-D"]
 
+# A KSA mapping row is kept deliberately compact.  More mapped responsibilities
+# continue on the next row beneath the same (vertically merged) KSA cell.
+KSA_RESPONSIBILITIES_PER_ROW = 13
+KSA_COLUMN_WIDTH_INCHES = 3.10
+KSA_TABLE_WIDTH_INCHES = 7.30
+
 # NO levels may reuse P-level narrative text, but never Responsibility/KSA tables.
 LEVEL_EQUIVALENT = {
     "NO-A": "P-1",
@@ -1030,6 +1036,26 @@ def _set_cell_borders(cell, color="000000", size="6") -> None:
         element.set(qn("w:color"), color)
 
 
+def _set_ksa_number_borders(cell, *, is_last_number_column: bool, is_last_body_row: bool) -> None:
+    """Remove the grid between KSA responsibility numbers, keeping only the outer edge."""
+    tc_pr = cell._tc.get_or_add_tcPr()
+    tc_borders = tc_pr.first_child_found_in("w:tcBorders")
+    if tc_borders is None:
+        tc_borders = OxmlElement("w:tcBorders")
+        tc_pr.append(tc_borders)
+
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        tag = "w:" + edge
+        element = tc_borders.find(qn(tag))
+        if element is None:
+            element = OxmlElement(tag)
+            tc_borders.append(element)
+        element.set(qn("w:val"), "single" if (edge == "right" and is_last_number_column) or (edge == "bottom" and is_last_body_row) else "nil")
+        element.set(qn("w:sz"), "6")
+        element.set(qn("w:space"), "0")
+        element.set(qn("w:color"), "000000")
+
+
 def _set_cell_width(cell, width_inches: float) -> None:
     cell.width = Inches(width_inches)
     tc_pr = cell._tc.get_or_add_tcPr()
@@ -1039,6 +1065,30 @@ def _set_cell_width(cell, width_inches: float) -> None:
         tc_pr.append(tc_w)
     tc_w.set(qn("w:w"), str(int(width_inches * 1440)))
     tc_w.set(qn("w:type"), "dxa")
+
+
+def _set_fixed_table_layout(table, widths: List[float]) -> None:
+    """Lock a table's grid so Word preserves the intended KSA column width."""
+    table.autofit = False
+    total_width = int(sum(widths) * 1440)
+    tbl_pr = table._tbl.tblPr
+
+    tbl_w = tbl_pr.first_child_found_in("w:tblW")
+    if tbl_w is None:
+        tbl_w = OxmlElement("w:tblW")
+        tbl_pr.append(tbl_w)
+    tbl_w.set(qn("w:w"), str(total_width))
+    tbl_w.set(qn("w:type"), "dxa")
+
+    tbl_layout = tbl_pr.first_child_found_in("w:tblLayout")
+    if tbl_layout is None:
+        tbl_layout = OxmlElement("w:tblLayout")
+        tbl_pr.append(tbl_layout)
+    tbl_layout.set(qn("w:type"), "fixed")
+
+    grid_columns = table._tbl.tblGrid.gridCol_lst
+    for grid_column, width_inches in zip(grid_columns, widths):
+        grid_column.set(qn("w:w"), str(int(width_inches * 1440)))
 
 
 def _format_cell_text(cell, font_size=8, bold=False, font_color: Optional[str] = None, align: Optional[int] = None) -> None:
@@ -1116,7 +1166,12 @@ def _paragraph_is_heading(paragraph, name: str) -> bool:
     return paragraph.text.strip().lower().startswith(name.lower())
 
 
-def _clear_tables_after_heading_until(doc: DocumentObject, start_heading: str, stop_headings: Iterable[str]) -> Optional[object]:
+def _clear_tables_after_heading_until(
+    doc: DocumentObject,
+    start_heading: str,
+    stop_headings: Iterable[str],
+    start_paragraph=None,
+) -> Optional[object]:
     """
     Remove tables after a heading until a stop heading is reached.
     Returns the heading paragraph object.
@@ -1124,17 +1179,23 @@ def _clear_tables_after_heading_until(doc: DocumentObject, start_heading: str, s
     body = doc._body._element
     children = list(body)
     start_idx = None
-    for i, child in enumerate(children):
-        if child.tag.endswith("}p"):
-            p = None
-            # Map XML paragraph to python-docx paragraph.
-            for para in doc.paragraphs:
-                if para._p is child:
-                    p = para
+    if start_paragraph is not None:
+        try:
+            start_idx = children.index(start_paragraph._p)
+        except ValueError:
+            return None
+    if start_idx is None:
+        for i, child in enumerate(children):
+            if child.tag.endswith("}p"):
+                p = None
+                # Map XML paragraph to python-docx paragraph.
+                for para in doc.paragraphs:
+                    if para._p is child:
+                        p = para
+                        break
+                if p is not None and _paragraph_is_heading(p, start_heading):
+                    start_idx = i
                     break
-            if p is not None and _paragraph_is_heading(p, start_heading):
-                start_idx = i
-                break
     if start_idx is None:
         return None
 
@@ -1154,6 +1215,25 @@ def _clear_tables_after_heading_until(doc: DocumentObject, start_heading: str, s
 def _find_heading_paragraph(doc: DocumentObject, heading: str) -> Optional[object]:
     for paragraph in doc.paragraphs:
         if _paragraph_is_heading(paragraph, heading):
+            return paragraph
+    return None
+
+
+def _find_exact_heading_after(doc: DocumentObject, heading: str, after_paragraph=None) -> Optional[object]:
+    """Find a body heading after a known section anchor, preserving document order."""
+    body = doc._body._element
+    children = list(body)
+    paragraph_by_xml = {paragraph._p: paragraph for paragraph in doc.paragraphs}
+    start_index = 0
+    if after_paragraph is not None:
+        try:
+            start_index = children.index(after_paragraph._p) + 1
+        except ValueError:
+            return None
+    wanted = heading.strip().lower()
+    for child in children[start_index:]:
+        paragraph = paragraph_by_xml.get(child)
+        if paragraph is not None and paragraph.text.strip().lower() == wanted:
             return paragraph
     return None
 
@@ -1250,6 +1330,54 @@ def add_responsibility_table_after(
     return table
 
 
+def _responsibility_table_anchor(doc: DocumentObject, responsibilities_heading):
+    """
+    Keep the template's mandatory-responsibilities note directly below the
+    Responsibilities heading, then place Output_<level>_Resp below that note.
+    """
+    body = doc._body._element
+    children = list(body)
+    try:
+        heading_index = children.index(responsibilities_heading._p)
+    except ValueError:
+        return responsibilities_heading
+
+    paragraph_by_xml = {paragraph._p: paragraph for paragraph in doc.paragraphs}
+    stop_headings = (
+        "skills",
+        "knowledge, skills",
+        "specialty",
+        "introduction",
+        "education",
+        "work experience",
+        "work interactions",
+        "responsibilities",
+    )
+    for child in children[heading_index + 1:]:
+        if child.tag.endswith("}tbl"):
+            break
+        paragraph = paragraph_by_xml.get(child)
+        if paragraph is None:
+            continue
+        text = paragraph.text.strip().lower()
+        if text.startswith(stop_headings):
+            break
+        if "mandatory responsibilities" in text or "shown in bold" in text:
+            return paragraph
+    return responsibilities_heading
+
+
+def add_responsibility_table_below_heading(
+    doc: DocumentObject,
+    responsibilities_heading,
+    responsibilities: List[Responsibility],
+    header_title: str = "[Responsibilities]",
+) -> object:
+    """Insert Output_<level>_Resp inside the Responsibilities section."""
+    anchor = _responsibility_table_anchor(doc, responsibilities_heading)
+    return add_responsibility_table_after(anchor, responsibilities, header_title)
+
+
 def _chunks(items: List[int], size: int) -> List[List[int]]:
     return [items[i:i + size] for i in range(0, len(items), size)]
 
@@ -1259,24 +1387,20 @@ def add_ksa_table_after(
     ksa_rows: List[KsaRow],
     responsibilities: List[Responsibility],
     header_title: str = "Responsibilities",
-    max_numbers_per_line: Optional[int] = None,
 ) -> object:
     """
     Build the Skills/KSA mapping table.
 
     Important:
     - Keep ALL mapped responsibility numbers.
-    - If one KSA maps to more than max_numbers_per_line responsibilities,
-      add continuation rows instead of deleting the extra numbers.
+    - If one KSA maps to more than 13 responsibilities, add continuation rows
+      instead of deleting the extra numbers.  The KSA cell is merged across
+      those rows, so the continued numbers remain visibly under the same KSA.
     - The generated GJP table omits the Excel No. column.
       Continuation rows keep the KSA text blank and continue the remaining numbers.
     """
     resp_by_no = {r.number: r for r in responsibilities}
-    if max_numbers_per_line is None:
-        max_numbers_per_line = max(
-            1,
-            max((len(row.responsibilities) for row in ksa_rows), default=1),
-        )
+    max_numbers_per_line = KSA_RESPONSIBILITIES_PER_ROW
 
     # Build expanded rows first so we know the total row count.
     expanded_rows = []
@@ -1293,8 +1417,9 @@ def add_ksa_table_after(
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
     table.style = "Table Grid"
 
-    number_width = max(0.22, 4.35 / max_numbers_per_line)
-    widths = [2.95] + [number_width] * max_numbers_per_line
+    number_width = (KSA_TABLE_WIDTH_INCHES - KSA_COLUMN_WIDTH_INCHES) / max_numbers_per_line
+    widths = [KSA_COLUMN_WIDTH_INCHES] + [number_width] * max_numbers_per_line
+    _set_fixed_table_layout(table, widths)
 
     # Header
     header_cells = ["Knowledge, Skills, and Abilities", header_title] + [""] * (max_numbers_per_line - 1)
@@ -1314,7 +1439,8 @@ def add_ksa_table_after(
 
     # Body
     for r, (ksa, chunk, chunk_index) in enumerate(expanded_rows, start=1):
-        # Only the first visual row displays KSA text.
+        # The first cell is merged with its continuation cell(s) below after
+        # the number grid is populated.
         ksa_cell = table.cell(r, 0)
         ksa_cell.text = ksa.text if chunk_index == 0 else ""
         _set_cell_borders(ksa_cell)
@@ -1347,7 +1473,11 @@ def add_ksa_table_after(
             else:
                 cell.text = ""
 
-            _set_cell_borders(cell)
+            _set_ksa_number_borders(
+                cell,
+                is_last_number_column=(offset == max_numbers_per_line - 1),
+                is_last_body_row=(r == len(expanded_rows)),
+            )
             _set_cell_width(cell, widths[c])
             _format_cell_text(
                 cell,
@@ -1356,6 +1486,27 @@ def add_ksa_table_after(
                 or bool(mapped_resp and mapped_resp.mandatory),
                 align=WD_ALIGN_PARAGRAPH.CENTER,
             )
+
+    # Merge the first column for each multi-line KSA.  This makes it clear that
+    # responsibility 14+ is a continuation of the same KSA, not a new KSA.
+    row_start = 1
+    for ksa in ksa_rows:
+        chunk_count = max(1, len(_chunks(list(ksa.responsibilities or []), max_numbers_per_line)))
+        row_end = row_start + chunk_count - 1
+        if chunk_count > 1:
+            merged_ksa_cell = table.cell(row_start, 0).merge(table.cell(row_end, 0))
+            merged_ksa_cell.text = ksa.text
+            _set_cell_borders(merged_ksa_cell)
+            _set_cell_width(merged_ksa_cell, widths[0])
+            if ksa.text_fill_hex:
+                _set_cell_fill(merged_ksa_cell, ksa.text_fill_hex)
+            _format_cell_text(
+                merged_ksa_cell,
+                font_size=7,
+                bold=bool(ksa.text_bold),
+                align=WD_ALIGN_PARAGRAPH.LEFT,
+            )
+        row_start = row_end + 1
 
     if max_numbers_per_line > 1:
         merged = table.cell(0, 1).merge(table.cell(0, total_cols - 1))
@@ -1555,6 +1706,7 @@ def _replace_specialty_blocks(
         if table_data is None or specialty_paragraph._p.getparent() is not body:
             continue
         segment = [child for child in original_children[start:end] if child.getparent() is body]
+        intro_heading_found = False
         resp_heading = None
         ksa_heading = None
         for child in segment:
@@ -1562,9 +1714,15 @@ def _replace_specialty_blocks(
             if paragraph is None:
                 continue
             text = paragraph.text.strip().lower()
-            if text == "responsibilities":
+            if text == "introduction":
+                intro_heading_found = True
+            elif intro_heading_found and resp_heading is None and text == "responsibilities":
                 resp_heading = paragraph
-            elif text == "skills" or text.startswith("knowledge, skills"):
+            elif resp_heading is not None and text == "skills":
+                ksa_heading = paragraph
+                break
+            elif resp_heading is not None and ksa_heading is None and text.startswith("knowledge, skills"):
+                # Use this only when a separate "Skills" heading is absent.
                 ksa_heading = paragraph
         intro_text = _introduction_for_specialty(introductions, target_level, table_data.specialty)
         _replace_intro_inside_segment(body, segment, paragraph_by_xml, intro_text)
@@ -1582,7 +1740,7 @@ def _replace_specialty_blocks(
             header_title,
             flags=re.I,
         )
-        add_responsibility_table_after(resp_heading, table_data.responsibilities, header_title)
+        add_responsibility_table_below_heading(doc, resp_heading, table_data.responsibilities, header_title)
         last_block = add_ksa_table_after(ksa_heading, table_data.ksa_rows, table_data.responsibilities, header_title)
 
     if last_block is None:
@@ -1611,7 +1769,7 @@ def _replace_specialty_blocks(
         resp_p = _insert_paragraph_after(last_block, "Responsibilities")
         _format_section_heading(resp_p)
         header_title = table_data.header_title or f"{target_level} {gjp_area} Responsibilities"
-        last_block = add_responsibility_table_after(resp_p, table_data.responsibilities, header_title)
+        last_block = add_responsibility_table_below_heading(doc, resp_p, table_data.responsibilities, header_title)
 
         skill_p = _insert_paragraph_after(last_block, "Knowledge, Skills, Abilities (KSAs)")
         _format_section_heading(skill_p)
@@ -1688,23 +1846,37 @@ def replace_tables_in_document(
     if not level_tables:
         return
 
-    # Keep the original headings exactly where they are in the template.
-    # Only remove the old tables below those headings.
-    resp_heading = _clear_tables_after_heading_until(doc, "Responsibilities", ["Skills"])
-    skills_heading = _clear_tables_after_heading_until(doc, "Skills", ["**Note", "Note", "Education", "Work Experience", "Work Interactions", "Introduction", "Responsibilities"])
-
-    if resp_heading is None:
-        resp_heading = doc.add_paragraph("Responsibilities")
-        _format_section_heading(resp_heading)
-    if skills_heading is None:
-        skills_heading = doc.add_paragraph("Skills")
-        _format_section_heading(skills_heading)
-
     # First specialty uses the original template locations.
     first = level_tables[0]
     first_intro = _introduction_for_specialty(introductions, target_level, first.specialty)
     if first_intro:
         _replace_section_paragraph_text(doc, "Introduction", first_intro, ["Responsibilities", "Skills"])
+
+    # For templates without specialty blocks, locate the headings in their
+    # required order: Introduction -> Responsibilities -> Skills.
+    intro_heading = _find_exact_heading_after(doc, "Introduction")
+    resp_heading = _find_exact_heading_after(doc, "Responsibilities", intro_heading)
+    skills_heading = _find_exact_heading_after(doc, "Skills", resp_heading)
+
+    if resp_heading is None:
+        if skills_heading is not None:
+            resp_heading = _insert_paragraph_before(skills_heading, "Responsibilities")
+        else:
+            resp_heading = doc.add_paragraph("Responsibilities")
+        _format_section_heading(resp_heading)
+    if skills_heading is None:
+        skills_heading = doc.add_paragraph("Skills")
+        _format_section_heading(skills_heading)
+
+    # Keep the original headings exactly where they are in the template and
+    # remove only old tables in their respective sections.
+    _clear_tables_after_heading_until(doc, "Responsibilities", ["Skills"], resp_heading)
+    _clear_tables_after_heading_until(
+        doc,
+        "Skills",
+        ["**Note", "Note", "Education", "Work Experience", "Work Interactions", "Introduction", "Responsibilities"],
+        skills_heading,
+    )
 
     # If the first table has a real specialty name, place it immediately before
     # Responsibilities, so the order remains:
@@ -1714,7 +1886,7 @@ def replace_tables_in_document(
         _format_section_heading(spec_p)
 
     first_header = first.header_title or f"{target_level} {gjp_area} Responsibilities".strip()
-    add_responsibility_table_after(resp_heading, first.responsibilities, first_header)
+    add_responsibility_table_below_heading(doc, resp_heading, first.responsibilities, first_header)
     last_block = add_ksa_table_after(skills_heading, first.ksa_rows, first.responsibilities, first_header)
 
     # Additional specialties are appended after the previous Skills table.
@@ -1735,7 +1907,7 @@ def replace_tables_in_document(
         resp_p = _insert_paragraph_after(last_block, "Responsibilities")
         _format_section_heading(resp_p)
         table_header = tbl.header_title or f"{target_level} {gjp_area} Responsibilities".strip()
-        last_block = add_responsibility_table_after(resp_p, tbl.responsibilities, table_header)
+        last_block = add_responsibility_table_below_heading(doc, resp_p, tbl.responsibilities, table_header)
 
         skill_p = _insert_paragraph_after(last_block, "Skills")
         _format_section_heading(skill_p)
