@@ -7,13 +7,13 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 from docx import Document
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 from docx.oxml.table import CT_Tbl
 from docx.oxml.text.paragraph import CT_P
 from docx.table import Table
 from docx.text.paragraph import Paragraph
 
-from openpyxl.styles import Font, Border, Side, Alignment
+from openpyxl.styles import Font, Border, Side, Alignment, PatternFill
 from openpyxl.utils import get_column_letter
 
 
@@ -1865,10 +1865,336 @@ def fill_template_if_provided(df, template_file):
 
 
 # =========================
+# AoW/KSA mapping matrix generator
+# =========================
+
+AOW_RESPONSIBILITY_HEADERS = ("area of work", "no", "responsibilities")
+AOW_KSA_HEADER_KEYWORDS = ("knowledge", "skills", "abilities")
+
+
+def aow_row_texts(row):
+    return [clean_text(cell.text) for cell in row.cells]
+
+
+def aow_extract_numbers(text):
+    return set(re.findall(r"\d+", clean_text(text)))
+
+
+def aow_looks_like_responsibility_table(table):
+    if not table.rows:
+        return False
+    header = " | ".join(aow_row_texts(table.rows[0])).lower()
+    return all(keyword in header for keyword in AOW_RESPONSIBILITY_HEADERS)
+
+
+def aow_looks_like_ksa_table(table):
+    if not table.rows:
+        return False
+    first_cell = clean_text(table.rows[0].cells[0].text).lower()
+    return all(keyword in first_cell for keyword in AOW_KSA_HEADER_KEYWORDS)
+
+
+def aow_find_responsibility_table(document):
+    candidates = [table for table in document.tables if aow_looks_like_responsibility_table(table)]
+    if candidates:
+        return candidates[0]
+    raise ValueError(
+        "No responsibilities table was found. The Word file should include "
+        "Area of Work, No., and Responsibilities headers."
+    )
+
+
+def aow_find_ksa_table(document):
+    candidates = [table for table in document.tables if aow_looks_like_ksa_table(table)]
+    if candidates:
+        return candidates[0]
+    raise ValueError(
+        "No KSA mapping table was found. The Word file should include a "
+        "Knowledge, Skills, and Abilities table."
+    )
+
+
+def aow_header_index(headers, keywords):
+    lowered = [header.lower() for header in headers]
+    for keyword in keywords:
+        for index, header in enumerate(lowered):
+            if keyword in header:
+                return index
+    return None
+
+
+def aow_parse_responsibilities(document):
+    table = aow_find_responsibility_table(document)
+    headers = aow_row_texts(table.rows[0])
+    theme_col = aow_header_index(headers, ("area of work", "theme"))
+    number_col = aow_header_index(headers, ("no.", "no", "nr", "number"))
+    resp_col = aow_header_index(headers, ("responsibilities", "responsibility"))
+
+    if theme_col is None or number_col is None or resp_col is None:
+        raise ValueError(
+            "The responsibilities table headers could not be recognized. "
+            "Required headers: Area of Work, No., Responsibilities."
+        )
+
+    responsibilities = []
+    last_theme = ""
+    for row in table.rows[1:]:
+        cells = aow_row_texts(row)
+        if len(cells) <= max(theme_col, number_col, resp_col):
+            continue
+
+        theme = cells[theme_col] or last_theme
+        number_match = re.search(r"\d+", cells[number_col])
+        number = number_match.group(0) if number_match else clean_text(cells[number_col])
+        text = cells[resp_col]
+
+        if theme:
+            last_theme = theme
+        if number and text:
+            responsibilities.append({
+                "theme": theme,
+                "number": number,
+                "text": text,
+            })
+
+    if not responsibilities:
+        raise ValueError("No valid responsibility rows were found.")
+    return responsibilities
+
+
+def aow_parse_ksa_mapping(document):
+    table = aow_find_ksa_table(document)
+    ksas = []
+    mapping_by_number = {}
+
+    for row in table.rows[1:]:
+        cells = aow_row_texts(row)
+        if not cells:
+            continue
+
+        ksa = cells[0]
+        if not ksa or all(keyword in ksa.lower() for keyword in AOW_KSA_HEADER_KEYWORDS):
+            continue
+
+        if ksa not in ksas:
+            ksas.append(ksa)
+
+        for number in aow_extract_numbers(" ".join(cells[1:])):
+            mapping_by_number.setdefault(number, set()).add(ksa)
+
+    if not ksas:
+        raise ValueError("No valid KSA rows were found.")
+    return ksas, mapping_by_number
+
+
+def aow_build_dataframe(responsibilities, ksas, mapping_by_number, mark, include_assigned_sme, collapse_theme):
+    rows = []
+    previous_theme = None
+
+    for responsibility in responsibilities:
+        shown_theme = responsibility["theme"]
+        if collapse_theme and responsibility["theme"] == previous_theme:
+            shown_theme = ""
+        previous_theme = responsibility["theme"]
+
+        row = {
+            "Theme": shown_theme,
+            "Number": responsibility["number"],
+            "Responsibilities": responsibility["text"],
+        }
+        if include_assigned_sme:
+            row["Assigned SME"] = ""
+
+        linked_ksas = mapping_by_number.get(responsibility["number"], set())
+        for ksa in ksas:
+            row[ksa] = mark if ksa in linked_ksas else ""
+
+        rows.append(row)
+
+    base_columns = ["Theme", "Number", "Responsibilities"]
+    if include_assigned_sme:
+        base_columns.append("Assigned SME")
+
+    return pd.DataFrame(rows, columns=base_columns + ksas)
+
+
+def aow_apply_sheet_style(ws, row_count, col_count, include_assigned_sme):
+    dark_fill = PatternFill("solid", fgColor="1F4E78")
+    note_fill = PatternFill("solid", fgColor="EAF3F8")
+    header_font = Font(color="FFFFFF", bold=True)
+    note_font = Font(color="1F4E78", bold=True)
+    thin_gray = Side(style="thin", color="D9E2EA")
+    medium_blue = Side(style="medium", color="1F4E78")
+    border = Border(left=thin_gray, right=thin_gray, top=thin_gray, bottom=thin_gray)
+
+    ws.sheet_view.showGridLines = False
+    ws.freeze_panes = "E4" if include_assigned_sme else "D4"
+
+    ws.cell(1, 1).value = "Please enter an X to map KSAs to responsibilities"
+    ws.cell(2, 1).value = "Generated from Word responsibilities and KSA mapping tables"
+
+    for row in (1, 2):
+        for col in range(1, col_count + 1):
+            cell = ws.cell(row, col)
+            cell.fill = note_fill
+            cell.font = note_font
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
+    ws.row_dimensions[1].height = 22
+    ws.row_dimensions[2].height = 22
+
+    for cell in ws[3]:
+        cell.fill = dark_fill
+        cell.font = header_font
+        cell.border = Border(top=medium_blue, bottom=medium_blue)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.row_dimensions[3].height = 58
+
+    theme_fills = [
+        PatternFill("solid", fgColor="FFFFFF"),
+        PatternFill("solid", fgColor="F6FAFD"),
+    ]
+    current_fill_index = 0
+    last_visible_theme = None
+    first_ksa_col = 5 if include_assigned_sme else 4
+
+    for row in range(4, row_count + 4):
+        visible_theme = clean_text(ws.cell(row, 1).value)
+        if visible_theme and visible_theme != last_visible_theme:
+            current_fill_index = 1 - current_fill_index
+            last_visible_theme = visible_theme
+
+        fill = theme_fills[current_fill_index]
+        for col in range(1, col_count + 1):
+            cell = ws.cell(row, col)
+            cell.fill = fill
+            cell.border = border
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+
+        ws.cell(row, 2).alignment = Alignment(horizontal="center", vertical="top", wrap_text=True)
+        for col in range(first_ksa_col, col_count + 1):
+            ws.cell(row, col).alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        ws.row_dimensions[row].height = 54
+
+    widths = {1: 22, 2: 8, 3: 72}
+    if include_assigned_sme:
+        widths[4] = 16
+    for col in range(first_ksa_col, col_count + 1):
+        widths[col] = 24
+    for col, width in widths.items():
+        ws.column_dimensions[get_column_letter(col)].width = width
+
+    ws.auto_filter.ref = f"A3:{get_column_letter(col_count)}{row_count + 3}"
+
+
+def aow_dataframe_to_xlsx(df, include_assigned_sme):
+    workbook = Workbook()
+    ws = workbook.active
+    ws.title = "AoW Mapping"
+
+    for col_index, column_name in enumerate(df.columns, start=1):
+        ws.cell(3, col_index).value = column_name
+    for row_index, values in enumerate(df.itertuples(index=False, name=None), start=4):
+        for col_index, value in enumerate(values, start=1):
+            ws.cell(row_index, col_index).value = value
+
+    aow_apply_sheet_style(ws, len(df), len(df.columns), include_assigned_sme)
+
+    output = io.BytesIO()
+    workbook.save(output)
+    output.seek(0)
+    return output
+
+
+def aow_convert_docx(file_bytes, mark, include_assigned_sme, collapse_theme):
+    document = Document(io.BytesIO(file_bytes))
+    responsibilities = aow_parse_responsibilities(document)
+    ksas, mapping_by_number = aow_parse_ksa_mapping(document)
+    df = aow_build_dataframe(
+        responsibilities=responsibilities,
+        ksas=ksas,
+        mapping_by_number=mapping_by_number,
+        mark=mark,
+        include_assigned_sme=include_assigned_sme,
+        collapse_theme=collapse_theme,
+    )
+    excel_output = aow_dataframe_to_xlsx(df, include_assigned_sme=include_assigned_sme)
+
+    responsibility_numbers = {item["number"] for item in responsibilities}
+    mapped_numbers = set(mapping_by_number)
+    warnings = []
+
+    unknown_numbers = sorted(mapped_numbers - responsibility_numbers, key=lambda x: int(x) if x.isdigit() else 99999)
+    if unknown_numbers:
+        warnings.append(f"The KSA table references responsibility numbers that were not found: {', '.join(unknown_numbers)}")
+
+    unmapped_numbers = sorted(responsibility_numbers - mapped_numbers, key=lambda x: int(x) if x.isdigit() else 99999)
+    if unmapped_numbers:
+        warnings.append(f"These responsibility numbers do not have any KSA marks: {', '.join(unmapped_numbers)}")
+
+    return df, excel_output, responsibilities, ksas, warnings
+
+
+# =========================
 # Streamlit website
 # =========================
 
 from gjp_document_generator import render_gjp_document_generator
+
+
+def render_aow_ksa_mapping_matrix():
+    st.title("AoW/KSA Mapping Matrix Generator")
+    st.write(
+        "Upload one Word document with responsibilities and KSA mapping tables. "
+        "This tool generates an Excel matrix with Theme, Number, Responsibilities, "
+        "and one column for each KSA. Mapped cells are marked with a capital X."
+    )
+
+    with st.sidebar:
+        st.markdown("---")
+        st.header("AoW/KSA settings")
+        include_assigned_sme = st.checkbox("Include blank Assigned SME column", value=True)
+        collapse_theme = st.checkbox("Show each theme only once", value=True)
+        st.caption("KSA mark: X")
+
+    uploaded_file = st.file_uploader(
+        "Upload a Word document",
+        type=["docx"],
+        accept_multiple_files=False
+    )
+
+    if uploaded_file is None:
+        st.info("Upload a Word document to begin.")
+        return
+
+    try:
+        df, excel_output, responsibilities, ksas, warnings = aow_convert_docx(
+            file_bytes=uploaded_file.getvalue(),
+            mark="X",
+            include_assigned_sme=include_assigned_sme,
+            collapse_theme=collapse_theme,
+        )
+    except Exception as e:
+        st.error(f"Conversion failed: {e}")
+        return
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Responsibilities", len(responsibilities))
+    col2.metric("KSA columns", len(ksas))
+    col3.metric("Output columns", len(df.columns))
+
+    for warning in warnings:
+        st.warning(warning)
+
+    st.subheader("Preview")
+    st.dataframe(df, use_container_width=True, height=520)
+
+    output_name = uploaded_file.name.rsplit(".", 1)[0] + "_AoW_KSA_mapping.xlsx"
+    st.download_button(
+        label="Download AoW/KSA Excel",
+        data=excel_output,
+        file_name=output_name,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
 
 def render_word_to_excel():
@@ -2118,13 +2444,17 @@ def main():
         "Choose a function",
         [
             "Word to Excel",
+            "Word to AoW/KSA Matrix",
             "Excel + Word to New GJP"
         ],
-        index=1
+        index=2
     )
 
     if page == "Word to Excel":
         render_word_to_excel()
+
+    elif page == "Word to AoW/KSA Matrix":
+        render_aow_ksa_mapping_matrix()
 
     elif page == "Excel + Word to New GJP":
         render_gjp_document_generator()
