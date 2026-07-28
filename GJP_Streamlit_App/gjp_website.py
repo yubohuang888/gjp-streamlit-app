@@ -2139,6 +2139,7 @@ def aow_convert_docx(file_bytes, mark, include_assigned_sme, collapse_theme):
 # =========================
 
 from gjp_document_generator import render_gjp_document_generator
+from ksa_mapping_streamlit_app import render_ksa_conversion_tables
 
 
 def render_aow_ksa_mapping_matrix():
@@ -2445,7 +2446,8 @@ def main():
         [
             "Word to Excel",
             "Word to AoW/KSA Matrix",
-            "Excel + Word to New GJP"
+            "Excel + Word to New GJP",
+            "ksa_converion_tables",
         ],
         index=2
     )
@@ -2458,6 +2460,9 @@ def main():
 
     elif page == "Excel + Word to New GJP":
         render_gjp_document_generator()
+
+    elif page == "ksa_converion_tables":
+        render_ksa_conversion_tables()
 
 
 if __name__ == "__main__":
