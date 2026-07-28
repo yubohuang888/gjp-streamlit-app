@@ -2447,7 +2447,7 @@ def main():
             "Word to Excel",
             "Word to AoW/KSA Matrix",
             "Excel + Word to New GJP",
-            "ksa_converion_tables",
+            "ksa_conversion_tables",
         ],
         index=2
     )
@@ -2461,7 +2461,7 @@ def main():
     elif page == "Excel + Word to New GJP":
         render_gjp_document_generator()
 
-    elif page == "ksa_converion_tables":
+    elif page == "ksa_conversion_tables":
         render_ksa_conversion_tables()
 
 
