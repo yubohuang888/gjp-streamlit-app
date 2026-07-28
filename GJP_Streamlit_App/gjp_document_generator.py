@@ -3,12 +3,14 @@ GJP document generator page for Streamlit.
 
 What it does
 ------------
-1) Accepts either one KSA Excel file or a ZIP containing specialty Excel files.
-2) Uploads one GJP Word template.
-3) Uploads a Word file containing Work interaction and Introduction text.
-4) Generates all configured levels for the department/workstream.
-5) Replaces level text, updates work experience years, replaces Work Interactions and Introduction,
-   inserts available tables, and removes Responsibility/KSA sections where level data is unavailable.
+1) Accepts an optional KSA Excel file or ZIP containing specialty Excel files.
+2) Uploads one required GJP Word template.
+3) Accepts optional level-based Excel files for Introduction / Work Interactions
+   and Education / Work Experience.
+4) Generates the levels found in the supplied data, or one unchanged copy of
+   the template when no optional data is supplied.
+5) Replaces only content that was supplied. Empty or omitted inputs leave the
+   corresponding template content unchanged.
 
 Install requirements
 --------------------
@@ -53,9 +55,9 @@ OUTPUT_LEVELS = ["P-1", "P-2", "P-3", "P-4", "P-5", "D-1", "NO-A", "NO-B", "NO-C
 
 # A KSA mapping row is kept deliberately compact.  More mapped responsibilities
 # continue on the next row beneath the same (vertically merged) KSA cell.
-KSA_RESPONSIBILITIES_PER_ROW = 13
+KSA_RESPONSIBILITIES_PER_ROW = 10
 KSA_COLUMN_WIDTH_INCHES = 3.10
-KSA_TABLE_WIDTH_INCHES = 7.30
+KSA_NUMBER_COLUMN_WIDTH_INCHES = 0.32
 
 # NO levels may reuse P-level narrative text, but never Responsibility/KSA tables.
 LEVEL_EQUIVALENT = {
@@ -130,6 +132,7 @@ class LevelTables:
     responsibilities: List[Responsibility]
     ksa_rows: List[KsaRow]
     header_title: str = ""
+    profile: str = ""
 
 
 @dataclass
@@ -299,6 +302,14 @@ def _level_from_text(value: str) -> str:
     return _normalize_level(match.group(1)) if match else ""
 
 
+def _level_from_cell(value: object) -> str:
+    """Return a level only when the whole cell is a supported level label."""
+    text = str(value or "").strip()
+    if not re.fullmatch(r"(?:P\s*-?\s*[1-5]|D\s*-?\s*1|NO\s*-?\s*[A-D])", text, flags=re.I):
+        return ""
+    return _normalize_level(text)
+
+
 def parse_job_info_workbook(path: str | Path) -> Dict[str, JobInfo]:
     wb = load_workbook(path, data_only=True)
     ws = wb.active
@@ -376,7 +387,10 @@ def _replace_job_info(
     for paragraph in doc.paragraphs:
         text = _para_text(paragraph)
         new_text = ccog_pattern.sub(
-            lambda m: f"{m.group(1)}{job_info.ccog_code}{m.group(3)}{job_info.job_code}{m.group(5)}",
+            lambda m: (
+                f"{m.group(1)}{job_info.ccog_code or m.group(2)}"
+                f"{m.group(3)}{job_info.job_code or m.group(4)}{m.group(5)}"
+            ),
             text,
         )
         if new_text != text:
@@ -452,6 +466,105 @@ def parse_intro_interaction_docx(path: str | Path) -> Tuple[Dict[str, str], Dict
         for level, body in extract_by_level(intro_part).items()
     }
     return interactions, introductions
+
+
+NARRATIVE_SECTIONS = {
+    "introduction": "introduction",
+    "work interaction": "work_interactions",
+    "work interactions": "work_interactions",
+    "education": "education",
+    "work experience": "work_experience",
+}
+
+
+def parse_level_content_workbook(path: str | Path) -> Dict[str, Dict[str, str]]:
+    """
+    Read level-based narrative content from an Excel workbook.
+
+    Supported layout (the relevant table may be on any worksheet):
+
+        |                  | D1 | P5 | P4 | P3 | P2 |
+        | Introduction     | .. | .. | .. | .. | .. |
+        | Work interactions| .. | .. | .. | .. | .. |
+
+    Education and Work experience use the same layout. Blank cells are omitted,
+    so they never overwrite the corresponding text in the Word template.
+    """
+    wb = load_workbook(path, data_only=True, read_only=True)
+    result: Dict[str, Dict[str, str]] = {
+        section: {} for section in set(NARRATIVE_SECTIONS.values())
+    }
+
+    for ws in wb.worksheets:
+        for header_row in range(1, min(ws.max_row, 30) + 1):
+            level_columns = {
+                col: level
+                for col in range(1, ws.max_column + 1)
+                if (level := _level_from_cell(ws.cell(header_row, col).value))
+            }
+            if not level_columns:
+                continue
+
+            first_level_col = min(level_columns)
+            found_section = False
+            for row in range(header_row + 1, min(ws.max_row, header_row + 20) + 1):
+                section_key = ""
+                for label_col in range(1, first_level_col):
+                    label = re.sub(
+                        r"\s+",
+                        " ",
+                        str(ws.cell(row, label_col).value or "").strip().lower(),
+                    )
+                    if label in NARRATIVE_SECTIONS:
+                        section_key = NARRATIVE_SECTIONS[label]
+                        break
+                if not section_key:
+                    continue
+
+                found_section = True
+                for col, level in level_columns.items():
+                    value = ws.cell(row, col).value
+                    text = re.sub(r"\s+", " ", str(value or "")).strip()
+                    if text:
+                        result[section_key][level] = text
+
+            # A worksheet should contain only one relevant horizontal table.
+            if found_section:
+                break
+
+    return result
+
+
+def _merge_level_content(
+    target: Dict[str, Dict[str, str]],
+    incoming: Dict[str, Dict[str, str]],
+) -> None:
+    for section, by_level in incoming.items():
+        target.setdefault(section, {}).update(by_level)
+
+
+def _read_optional_narrative_file(
+    path: Optional[str | Path],
+) -> Dict[str, Dict[str, str]]:
+    if path is None:
+        return {section: {} for section in set(NARRATIVE_SECTIONS.values())}
+
+    suffix = Path(path).suffix.lower()
+    if suffix == ".xlsx":
+        return parse_level_content_workbook(path)
+    if suffix == ".docx":
+        interactions, introductions = parse_intro_interaction_docx(path)
+        return {
+            "introduction": {
+                level: by_specialty.get("", "")
+                for level, by_specialty in introductions.items()
+                if by_specialty.get("", "")
+            },
+            "work_interactions": interactions,
+            "education": {},
+            "work_experience": {},
+        }
+    raise ValueError(f"Unsupported narrative input type: {suffix}")
 
 
 # -----------------------------------------------------------------------------
@@ -599,9 +712,23 @@ def get_tables_for_level(all_tables: Dict[str, List[LevelTables]], target_level:
 
 
 OUTPUT_SHEET_RE = re.compile(
-    r"^output[\s_-]*(p[\s_-]?[1-5]|d[\s_-]?1|no[\s_-]?[a-d]).*?[\s_-](resp|ksa)$",
+    r"^output[\s_-]*(?P<level>p[\s_-]?[1-5]|d[\s_-]?1|no[\s_-]?[a-d])"
+    r"(?P<profile>.*?)[\s_-]+(?P<kind>resp|ksa)$",
     re.I,
 )
+
+
+def _output_profile_label(value: str) -> str:
+    """Keep meaningful output-sheet qualifiers such as Senior or Chief."""
+    text = re.sub(r"[_-]+", " ", str(value or ""))
+    text = re.sub(r"\brevis(?:e|ed|ion)?\b", " ", text, flags=re.I)
+    text = re.sub(r"\b(?:final|copy|version|output)\b", " ", text, flags=re.I)
+    text = re.sub(r"\bv\s*\d+(?:\.\d+)?\b", " ", text, flags=re.I)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _output_profile_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", _output_profile_label(value).lower()).strip()
 
 
 def _cell_fill_hex(cell) -> str:
@@ -929,34 +1056,40 @@ def parse_output_workbook(path: str | Path) -> Dict[str, List[LevelTables]]:
     wb = load_workbook(path, data_only=True)
     formula_wb = load_workbook(path, data_only=False)
     theme_color_map = _theme_color_map_from_workbook(wb)
-    pairs: Dict[str, Dict[str, Worksheet]] = {}
-    formula_pairs: Dict[str, Dict[str, Worksheet]] = {}
+    pairs: Dict[Tuple[str, str], Dict[str, object]] = {}
+    formula_pairs: Dict[Tuple[str, str], Dict[str, Worksheet]] = {}
     for ws in wb.worksheets:
         match = OUTPUT_SHEET_RE.match(ws.title.strip())
         if not match:
             continue
-        level = _normalize_level(match.group(1))
-        kind = match.group(2).lower()
-        pairs.setdefault(level, {})[kind] = ws
+        level = _normalize_level(match.group("level"))
+        profile = _output_profile_label(match.group("profile"))
+        pair_key = (level, _output_profile_key(profile))
+        pair = pairs.setdefault(pair_key, {"profile": profile})
+        pair[match.group("kind").lower()] = ws
     for ws in formula_wb.worksheets:
         match = OUTPUT_SHEET_RE.match(ws.title.strip())
         if not match:
             continue
-        level = _normalize_level(match.group(1))
-        kind = match.group(2).lower()
-        formula_pairs.setdefault(level, {})[kind] = ws
+        level = _normalize_level(match.group("level"))
+        pair_key = (level, _output_profile_key(match.group("profile")))
+        formula_pairs.setdefault(pair_key, {})[match.group("kind").lower()] = ws
 
     result: Dict[str, List[LevelTables]] = {}
-    for level, sheets in pairs.items():
+    for (level, profile_key), sheets in pairs.items():
         if "resp" not in sheets or "ksa" not in sheets:
             continue
+        resp_ws = sheets["resp"]
+        ksa_ws = sheets["ksa"]
+        if not isinstance(resp_ws, Worksheet) or not isinstance(ksa_ws, Worksheet):
+            continue
         specialty, header_title, responsibilities = _parse_output_responsibilities(
-            sheets["resp"],
+            resp_ws,
             str(path),
             theme_color_map,
-            formula_pairs.get(level, {}).get("resp"),
+            formula_pairs.get((level, profile_key), {}).get("resp"),
         )
-        ksa_rows = _parse_output_ksa(sheets["ksa"])
+        ksa_rows = _parse_output_ksa(ksa_ws)
         if responsibilities or ksa_rows:
             result.setdefault(level, []).append(
                 LevelTables(
@@ -965,6 +1098,7 @@ def parse_output_workbook(path: str | Path) -> Dict[str, List[LevelTables]]:
                     responsibilities=responsibilities,
                     ksa_rows=ksa_rows,
                     header_title=header_title,
+                    profile=str(sheets.get("profile") or ""),
                 )
             )
     return result
@@ -1162,6 +1296,41 @@ def _remove_element(element) -> None:
     element.getparent().remove(element)
 
 
+def _remove_blank_paragraphs_until(
+    doc: DocumentObject,
+    start_paragraph,
+    *,
+    end_paragraph=None,
+    stop_headings: Iterable[str] = (),
+) -> None:
+    """Remove empty template spacer/page-break paragraphs inside one section."""
+    body = doc._body._element
+    children = list(body)
+    try:
+        start_index = children.index(start_paragraph._p)
+    except ValueError:
+        return
+
+    end_element = end_paragraph._p if end_paragraph is not None else None
+    paragraph_by_xml = {paragraph._p: paragraph for paragraph in doc.paragraphs}
+    stop_lower = tuple(value.lower() for value in stop_headings)
+    for child in children[start_index + 1:]:
+        if child is end_element:
+            break
+        paragraph = paragraph_by_xml.get(child)
+        if paragraph is None:
+            continue
+        text = paragraph.text.strip()
+        if stop_lower and any(text.lower().startswith(value) for value in stop_lower):
+            break
+        if text:
+            continue
+        if child.xpath(".//w:drawing | .//w:pict"):
+            continue
+        if child.getparent() is body:
+            _remove_element(child)
+
+
 def _paragraph_is_heading(paragraph, name: str) -> bool:
     return paragraph.text.strip().lower().startswith(name.lower())
 
@@ -1234,6 +1403,34 @@ def _find_exact_heading_after(doc: DocumentObject, heading: str, after_paragraph
     for child in children[start_index:]:
         paragraph = paragraph_by_xml.get(child)
         if paragraph is not None and paragraph.text.strip().lower() == wanted:
+            return paragraph
+    return None
+
+
+def _is_ksa_heading_text(value: str) -> bool:
+    text = re.sub(r"[^a-z]+", " ", str(value or "").lower())
+    text = re.sub(r"\s+", " ", text).strip()
+    return (
+        len(text) <= 60
+        and text.startswith("knowledge skills")
+        and "abilities" in text
+    )
+
+
+def _find_ksa_heading_after(doc: DocumentObject, after_paragraph=None) -> Optional[object]:
+    """Find the existing Knowledge, Skills, Abilities (KSAs) section heading."""
+    body = doc._body._element
+    children = list(body)
+    paragraph_by_xml = {paragraph._p: paragraph for paragraph in doc.paragraphs}
+    start_index = 0
+    if after_paragraph is not None:
+        try:
+            start_index = children.index(after_paragraph._p) + 1
+        except ValueError:
+            return None
+    for child in children[start_index:]:
+        paragraph = paragraph_by_xml.get(child)
+        if paragraph is not None and _is_ksa_heading_text(paragraph.text):
             return paragraph
     return None
 
@@ -1393,7 +1590,7 @@ def add_ksa_table_after(
 
     Important:
     - Keep ALL mapped responsibility numbers.
-    - If one KSA maps to more than 13 responsibilities, add continuation rows
+    - If one KSA maps to more than 10 responsibilities, add continuation rows
       instead of deleting the extra numbers.  The KSA cell is merged across
       those rows, so the continued numbers remain visibly under the same KSA.
     - The generated GJP table omits the Excel No. column.
@@ -1411,18 +1608,20 @@ def add_ksa_table_after(
             expanded_rows.append((ksa, chunk, chunk_index))
 
     # 1 fixed KSA column + responsibility-number columns. The Excel No. column
-    # is intentionally not copied into the generated GJP document.
-    total_cols = 1 + max_numbers_per_line
+    # is intentionally not copied into the generated GJP document. Only create
+    # number columns that are actually used, capped at 10 per continuation row.
+    number_column_count = max((len(chunk) for _, chunk, _ in expanded_rows), default=0)
+    number_column_count = max(1, min(max_numbers_per_line, number_column_count))
+    total_cols = 1 + number_column_count
     table = _insert_table_after(paragraph, rows=len(expanded_rows) + 1, cols=total_cols)
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
     table.style = "Table Grid"
 
-    number_width = (KSA_TABLE_WIDTH_INCHES - KSA_COLUMN_WIDTH_INCHES) / max_numbers_per_line
-    widths = [KSA_COLUMN_WIDTH_INCHES] + [number_width] * max_numbers_per_line
+    widths = [KSA_COLUMN_WIDTH_INCHES] + [KSA_NUMBER_COLUMN_WIDTH_INCHES] * number_column_count
     _set_fixed_table_layout(table, widths)
 
     # Header
-    header_cells = ["Knowledge, Skills, and Abilities", header_title] + [""] * (max_numbers_per_line - 1)
+    header_cells = ["Knowledge, Skills, and Abilities", header_title] + [""] * (number_column_count - 1)
     for c, header in enumerate(header_cells):
         cell = table.cell(0, c)
         cell.text = header
@@ -1455,7 +1654,7 @@ def add_ksa_table_after(
         )
 
         # Fill responsibility numbers for this chunk.
-        for offset in range(max_numbers_per_line):
+        for offset in range(number_column_count):
             c = 1 + offset
             cell = table.cell(r, c)
             mapped_resp = None
@@ -1475,7 +1674,7 @@ def add_ksa_table_after(
 
             _set_ksa_number_borders(
                 cell,
-                is_last_number_column=(offset == max_numbers_per_line - 1),
+                is_last_number_column=(offset == number_column_count - 1),
                 is_last_body_row=(r == len(expanded_rows)),
             )
             _set_cell_width(cell, widths[c])
@@ -1508,7 +1707,7 @@ def add_ksa_table_after(
             )
         row_start = row_end + 1
 
-    if max_numbers_per_line > 1:
+    if number_column_count > 1:
         merged = table.cell(0, 1).merge(table.cell(0, total_cols - 1))
         merged.text = header_title
         _set_cell_fill(merged, HEADER_FILL)
@@ -1522,6 +1721,17 @@ def add_ksa_table_after(
         )
 
     return table
+
+
+def add_ksa_table_below_heading(
+    doc: DocumentObject,
+    ksa_heading,
+    ksa_rows: List[KsaRow],
+    responsibilities: List[Responsibility],
+    header_title: str = "Responsibilities",
+) -> object:
+    """Place the KSA table directly below its heading, before note/legend text."""
+    return add_ksa_table_after(ksa_heading, ksa_rows, responsibilities, header_title)
 
 
 def _is_general_specialty_name(name: str) -> bool:
@@ -1709,6 +1919,7 @@ def _replace_specialty_blocks(
         intro_heading_found = False
         resp_heading = None
         ksa_heading = None
+        skills_fallback = None
         for child in segment:
             paragraph = paragraph_by_xml.get(child)
             if paragraph is None:
@@ -1718,12 +1929,16 @@ def _replace_specialty_blocks(
                 intro_heading_found = True
             elif intro_heading_found and resp_heading is None and text == "responsibilities":
                 resp_heading = paragraph
-            elif resp_heading is not None and text == "skills":
+            elif resp_heading is not None and _is_ksa_heading_text(text):
                 ksa_heading = paragraph
                 break
-            elif resp_heading is not None and ksa_heading is None and text.startswith("knowledge, skills"):
-                # Use this only when a separate "Skills" heading is absent.
-                ksa_heading = paragraph
+            elif resp_heading is not None and text == "skills" and skills_fallback is None:
+                skills_fallback = paragraph
+        if ksa_heading is None:
+            ksa_heading = skills_fallback
+            if ksa_heading is not None:
+                ksa_heading.text = "Knowledge, Skills, Abilities (KSAs)"
+                _format_section_heading(ksa_heading)
         intro_text = _introduction_for_specialty(introductions, target_level, table_data.specialty)
         _replace_intro_inside_segment(body, segment, paragraph_by_xml, intro_text)
         for child in segment:
@@ -1741,7 +1956,13 @@ def _replace_specialty_blocks(
             flags=re.I,
         )
         add_responsibility_table_below_heading(doc, resp_heading, table_data.responsibilities, header_title)
-        last_block = add_ksa_table_after(ksa_heading, table_data.ksa_rows, table_data.responsibilities, header_title)
+        last_block = add_ksa_table_below_heading(
+            doc,
+            ksa_heading,
+            table_data.ksa_rows,
+            table_data.responsibilities,
+            header_title,
+        )
 
     if last_block is None:
         retained_blocks = [
@@ -1773,7 +1994,13 @@ def _replace_specialty_blocks(
 
         skill_p = _insert_paragraph_after(last_block, "Knowledge, Skills, Abilities (KSAs)")
         _format_section_heading(skill_p)
-        last_block = add_ksa_table_after(skill_p, table_data.ksa_rows, table_data.responsibilities, header_title)
+        last_block = add_ksa_table_below_heading(
+            doc,
+            skill_p,
+            table_data.ksa_rows,
+            table_data.responsibilities,
+            header_title,
+        )
 
 
 def _remove_all_responsibility_ksa_sections(doc: DocumentObject) -> None:
@@ -1826,7 +2053,7 @@ def replace_tables_in_document(
     introductions: Optional[Dict[str, Dict[str, str]]] = None,
 ) -> None:
     """
-    Replace the template Responsibilities and Skills tables without changing the
+    Replace the template Responsibilities and KSA tables without changing the
     template section order.
 
     The generated document follows the template order exactly:
@@ -1836,12 +2063,12 @@ def replace_tables_in_document(
         Work Interactions
         Introduction
         Responsibilities
-        Skills
+        Knowledge, Skills, Abilities (KSAs)
 
-    For the first specialty, the existing template Responsibilities and Skills
+    For the first specialty, the existing template Responsibilities and KSA
     headings are reused in place. Extra specialty blocks, if any, are appended
-    after the first Skills table in the same internal order:
-        Specialty -> Responsibilities -> Skills.
+    after the first KSA table in the same internal order:
+        Specialty -> Responsibilities -> Knowledge, Skills, Abilities (KSAs).
     """
     if not level_tables:
         return
@@ -1853,29 +2080,45 @@ def replace_tables_in_document(
         _replace_section_paragraph_text(doc, "Introduction", first_intro, ["Responsibilities", "Skills"])
 
     # For templates without specialty blocks, locate the headings in their
-    # required order: Introduction -> Responsibilities -> Skills.
+    # required order: Introduction -> Responsibilities -> KSA heading.
     intro_heading = _find_exact_heading_after(doc, "Introduction")
     resp_heading = _find_exact_heading_after(doc, "Responsibilities", intro_heading)
-    skills_heading = _find_exact_heading_after(doc, "Skills", resp_heading)
+    ksa_heading = _find_ksa_heading_after(doc, resp_heading)
+    if ksa_heading is None:
+        ksa_heading = _find_exact_heading_after(doc, "Skills", resp_heading)
+        if ksa_heading is not None:
+            ksa_heading.text = "Knowledge, Skills, Abilities (KSAs)"
+            _format_section_heading(ksa_heading)
 
     if resp_heading is None:
-        if skills_heading is not None:
-            resp_heading = _insert_paragraph_before(skills_heading, "Responsibilities")
+        if ksa_heading is not None:
+            resp_heading = _insert_paragraph_before(ksa_heading, "Responsibilities")
         else:
             resp_heading = doc.add_paragraph("Responsibilities")
         _format_section_heading(resp_heading)
-    if skills_heading is None:
-        skills_heading = doc.add_paragraph("Skills")
-        _format_section_heading(skills_heading)
+    if ksa_heading is None:
+        ksa_heading = doc.add_paragraph("Knowledge, Skills, Abilities (KSAs)")
+        _format_section_heading(ksa_heading)
 
     # Keep the original headings exactly where they are in the template and
     # remove only old tables in their respective sections.
-    _clear_tables_after_heading_until(doc, "Responsibilities", ["Skills"], resp_heading)
     _clear_tables_after_heading_until(
         doc,
-        "Skills",
+        "Responsibilities",
+        ["Knowledge, Skills", "Skills"],
+        resp_heading,
+    )
+    _clear_tables_after_heading_until(
+        doc,
+        ksa_heading.text,
         ["**Note", "Note", "Education", "Work Experience", "Work Interactions", "Introduction", "Responsibilities"],
-        skills_heading,
+        ksa_heading,
+    )
+    _remove_blank_paragraphs_until(doc, resp_heading, end_paragraph=ksa_heading)
+    _remove_blank_paragraphs_until(
+        doc,
+        ksa_heading,
+        stop_headings=["Education", "Work Experience", "Work Interactions", "Introduction", "Responsibilities", "Specialty"],
     )
 
     # If the first table has a real specialty name, place it immediately before
@@ -1887,7 +2130,13 @@ def replace_tables_in_document(
 
     first_header = first.header_title or f"{target_level} {gjp_area} Responsibilities".strip()
     add_responsibility_table_below_heading(doc, resp_heading, first.responsibilities, first_header)
-    last_block = add_ksa_table_after(skills_heading, first.ksa_rows, first.responsibilities, first_header)
+    last_block = add_ksa_table_below_heading(
+        doc,
+        ksa_heading,
+        first.ksa_rows,
+        first.responsibilities,
+        first_header,
+    )
 
     # Additional specialties are appended after the previous Skills table.
     # Each appended block is inserted sequentially after the previous block
@@ -1909,9 +2158,15 @@ def replace_tables_in_document(
         table_header = tbl.header_title or f"{target_level} {gjp_area} Responsibilities".strip()
         last_block = add_responsibility_table_below_heading(doc, resp_p, tbl.responsibilities, table_header)
 
-        skill_p = _insert_paragraph_after(last_block, "Skills")
+        skill_p = _insert_paragraph_after(last_block, "Knowledge, Skills, Abilities (KSAs)")
         _format_section_heading(skill_p)
-        last_block = add_ksa_table_after(skill_p, tbl.ksa_rows, tbl.responsibilities, table_header)
+        last_block = add_ksa_table_below_heading(
+            doc,
+            skill_p,
+            tbl.ksa_rows,
+            tbl.responsibilities,
+            table_header,
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -1927,18 +2182,23 @@ def generate_one_document(
     source_job_info: Optional[JobInfo] = None,
     interactions: Optional[Dict[str, str]] = None,
     introductions: Optional[Dict[str, Dict[str, str]]] = None,
+    education: Optional[Dict[str, str]] = None,
+    work_experience: Optional[Dict[str, str]] = None,
 ) -> bytes:
     doc = Document(str(template_path))
     source_level = detect_template_level(doc)
 
     replace_level_everywhere(doc, source_level, target_level)
     _replace_job_info(doc, source_level, target_level, job_info, source_job_info)
-    replace_work_experience_years(doc, target_level)
 
     # Use equivalent P-level text for NO-levels if exact NO text is not provided.
     lookup_level = target_level
     equivalent = LEVEL_EQUIVALENT.get(target_level)
     interaction_text = (interactions or {}).get(lookup_level) or ((interactions or {}).get(equivalent) if equivalent else None)
+    education_text = (education or {}).get(lookup_level) or ((education or {}).get(equivalent) if equivalent else None)
+    work_experience_text = (work_experience or {}).get(lookup_level) or (
+        (work_experience or {}).get(equivalent) if equivalent else None
+    )
 
     if interaction_text:
         _replace_section_paragraph_text(
@@ -1948,10 +2208,35 @@ def generate_one_document(
             ["Education", "Work Experience", "Specialty", "Introduction", "Responsibilities", "Skills"],
         )
 
+    if education_text:
+        _replace_section_paragraph_text(
+            doc,
+            "Education",
+            education_text,
+            ["Work Experience", "Work Interactions", "Specialty", "Introduction", "Responsibilities", "Skills"],
+        )
+
+    if work_experience_text:
+        _replace_section_paragraph_text(
+            doc,
+            "Work Experience",
+            work_experience_text,
+            ["Work Interactions", "Specialty", "Introduction", "Responsibilities", "Skills", "Education"],
+        )
+
     if level_tables:
         _replace_specialty_blocks(doc, level_tables, target_level, gjp_area, introductions)
     else:
-        _remove_all_responsibility_ksa_sections(doc)
+        introduction_text = _introduction_for_specialty(introductions, target_level, "")
+        if introduction_text:
+            _replace_section_paragraph_text(
+                doc,
+                "Introduction",
+                introduction_text,
+                ["Specialty", "Responsibilities", "Skills", "Education", "Work Experience", "Work Interactions"],
+            )
+    # If no replacement tables were supplied, retain the template's existing
+    # Responsibilities and KSA sections unchanged.
 
     buffer = io.BytesIO()
     doc.save(buffer)
@@ -1963,48 +2248,190 @@ def _safe_filename_part(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip(" .") or "GJP"
 
 
+def extract_template_job_title(doc: DocumentObject) -> str:
+    """Extract the visible job title from a GJP template."""
+    paragraphs = [re.sub(r"\s+", " ", p.text).strip() for p in doc.paragraphs]
+
+    for table in doc.tables[:5]:
+        for row in table.rows[:5]:
+            for cell in row.cells:
+                lines = [re.sub(r"\s+", " ", line).strip() for line in cell.text.splitlines()]
+                for index, line in enumerate(lines):
+                    if line.upper() != "GENERIC JOB PROFILE":
+                        continue
+                    for candidate in lines[index + 1:]:
+                        if candidate:
+                            return re.sub(
+                                r"\s*:\s*(?=(?:P|D|NO)\s*-?\s*(?:[1-5A-D])\b)",
+                                " ",
+                                candidate,
+                            ).strip()
+
+    for index, text in enumerate(paragraphs):
+        if text.upper() != "GENERIC JOB PROFILE":
+            continue
+        for candidate in paragraphs[index + 1:index + 7]:
+            if candidate and not candidate.lower().startswith("version"):
+                return re.sub(r"\s*:\s*(?=(?:P|D|NO)\s*-?\s*(?:[1-5A-D])\b)", " ", candidate).strip()
+
+    for text in paragraphs:
+        match = re.search(
+            r"^The\s+(.+?)\s+GJP(?:\s*2\.0)?\s+is\s+available\s+for\b",
+            text,
+            flags=re.I,
+        )
+        if match:
+            return re.sub(r"\s+", " ", match.group(1)).strip()
+
+    for text in paragraphs[:30]:
+        if _level_from_text(text) and len(text) <= 180 and "approved at the" not in text.lower():
+            return text
+    return "GJP"
+
+
+def _job_title_for_level(title: str, source_level: str, target_level: str) -> str:
+    result = str(title or "").strip()
+    variants = {
+        source_level,
+        _normalize_level(source_level),
+        _compact_level(source_level),
+    }
+    for variant in sorted(variants, key=len, reverse=True):
+        replacement = target_level if "-" in variant else _compact_level(target_level)
+        result = re.sub(rf"\b{re.escape(variant)}\b", replacement, result, flags=re.I)
+    return re.sub(r"\s+", " ", result).strip()
+
+
+def _ordered_output_levels(levels: Iterable[str]) -> List[str]:
+    normalized = {_normalize_level(level) for level in levels if _normalize_level(level)}
+    ordered = [level for level in OUTPUT_LEVELS if level in normalized]
+    ordered.extend(sorted(normalized - set(ordered)))
+    return ordered
+
+
+def _table_groups_for_level(level_tables: List[LevelTables]) -> List[Tuple[str, List[LevelTables]]]:
+    """
+    Keep distinct position/profile output pairs separate.
+
+    Multiple unqualified specialty tables still belong to one level document,
+    while qualifiers such as "Senior" and "Chief" create separate documents.
+    """
+    grouped: Dict[str, Tuple[str, List[LevelTables]]] = {}
+    for table_data in level_tables:
+        profile_label = _output_profile_label(table_data.profile)
+        profile_key = _output_profile_key(profile_label)
+        if profile_key not in grouped:
+            grouped[profile_key] = (profile_label, [])
+        grouped[profile_key][1].append(table_data)
+    return list(grouped.values())
+
+
+def _unique_document_filename(file_name: str, existing: Dict[str, bytes]) -> str:
+    if file_name not in existing:
+        return file_name
+    stem = Path(file_name).stem
+    suffix = Path(file_name).suffix or ".docx"
+    index = 2
+    while f"{stem} ({index}){suffix}" in existing:
+        index += 1
+    return f"{stem} ({index}){suffix}"
+
+
 def generate_documents(
-    job_info_path: str | Path,
-    excel_or_zip_path: str | Path,
+    job_info_path: Optional[str | Path],
+    excel_or_zip_path: Optional[str | Path],
     template_path: str | Path,
-    intro_interaction_path: str | Path,
+    intro_interaction_path: Optional[str | Path] = None,
+    education_work_experience_path: Optional[str | Path] = None,
+    department_name: str = "",
 ) -> Tuple[Dict[str, bytes], List[str]]:
-    job_infos = parse_job_info_workbook(job_info_path)
-    all_tables, warnings = parse_level_tables_from_upload(excel_or_zip_path)
-    interactions, introductions = parse_intro_interaction_docx(intro_interaction_path)
-    template_level = detect_template_level(Document(str(template_path)))
+    job_infos = parse_job_info_workbook(job_info_path) if job_info_path else {}
+    if excel_or_zip_path:
+        all_tables, warnings = parse_level_tables_from_upload(excel_or_zip_path)
+    else:
+        all_tables, warnings = {}, []
+
+    narrative_content: Dict[str, Dict[str, str]] = {
+        section: {} for section in set(NARRATIVE_SECTIONS.values())
+    }
+    introductions: Dict[str, Dict[str, str]] = {}
+    for narrative_path in (intro_interaction_path, education_work_experience_path):
+        if not narrative_path:
+            continue
+        if Path(narrative_path).suffix.lower() == ".docx":
+            # Preserve support for the former Introduction / Work Interactions
+            # Word format, including specialty-specific introductions.
+            docx_interactions, docx_introductions = parse_intro_interaction_docx(narrative_path)
+            narrative_content["work_interactions"].update(docx_interactions)
+            for level, by_specialty in docx_introductions.items():
+                introductions.setdefault(level, {}).update(by_specialty)
+        else:
+            parsed = _read_optional_narrative_file(narrative_path)
+            _merge_level_content(narrative_content, parsed)
+            for level, text in parsed.get("introduction", {}).items():
+                introductions.setdefault(level, {})[""] = text
+
+    template_doc = Document(str(template_path))
+    template_level = detect_template_level(template_doc)
+    template_job_title = extract_template_job_title(template_doc)
     source_job_info = job_infos.get(template_level)
 
-    documents: Dict[str, bytes] = {}
-    for level in OUTPUT_LEVELS:
-        tables = all_tables.get(level, [])
-        if not tables:
-            continue
-        job_info = job_infos.get(level)
-        gjp_area = _strip_level_from_title(job_info.job_title, level) if job_info else "GJP"
-        doc_bytes = generate_one_document(
-            template_path=template_path,
-            target_level=level,
-            level_tables=tables,
-            gjp_area=gjp_area,
-            job_info=job_info,
-            source_job_info=source_job_info,
-            interactions=interactions,
-            introductions=introductions,
-        )
-        if job_info and job_info.file_name:
-            file_name = _safe_filename_part(Path(job_info.file_name).stem) + ".docx"
-        else:
-            file_name = f"{_safe_filename_part(gjp_area)} GJP 2.0 - {level}.docx"
-        documents[file_name] = doc_bytes
+    if all_tables:
+        levels = _ordered_output_levels(all_tables)
+    elif job_infos:
+        levels = _ordered_output_levels(job_infos)
+    else:
+        narrative_levels = set()
+        for by_level in narrative_content.values():
+            narrative_levels.update(by_level)
+        narrative_levels.update(introductions)
+        levels = _ordered_output_levels(narrative_levels) or [template_level]
 
-    if not all_tables:
-        raise ValueError(
-            "No populated Output_<level>_Resp and Output_<level>_KSA sheet pair "
-            "was found in the uploaded Excel file(s)."
-        )
+    documents: Dict[str, bytes] = {}
+    for level in levels:
+        level_tables = all_tables.get(level, [])
+        table_groups = _table_groups_for_level(level_tables) if level_tables else [("", [])]
+        for profile, tables in table_groups:
+            job_info = job_infos.get(level)
+            gjp_area = (
+                _strip_level_from_title(job_info.job_title, level)
+                if job_info and job_info.job_title
+                else str(department_name or "").strip() or "GJP"
+            )
+            doc_bytes = generate_one_document(
+                template_path=template_path,
+                target_level=level,
+                level_tables=tables,
+                gjp_area=gjp_area,
+                job_info=job_info,
+                source_job_info=source_job_info,
+                interactions=narrative_content["work_interactions"],
+                introductions=introductions,
+                education=narrative_content["education"],
+                work_experience=narrative_content["work_experience"],
+            )
+            if job_info and job_info.file_name:
+                name_parts = [_safe_filename_part(Path(job_info.file_name).stem)]
+                if profile and profile.lower() not in name_parts[0].lower():
+                    name_parts.append(_safe_filename_part(profile))
+                file_name = " - ".join(name_parts) + ".docx"
+            else:
+                position = _job_title_for_level(template_job_title, template_level, level)
+                if not _level_from_text(position):
+                    position = f"{position} {level}".strip()
+                name_parts = [position]
+                if profile and profile.lower() not in position.lower():
+                    name_parts.append(profile)
+                department = str(department_name or "").strip()
+                combined_name = " ".join(name_parts)
+                if department and department.lower() not in combined_name.lower():
+                    name_parts.append(department)
+                file_name = " - ".join(_safe_filename_part(part) for part in name_parts if part) + ".docx"
+            file_name = _unique_document_filename(file_name, documents)
+            documents[file_name] = doc_bytes
+
     if not documents:
-        raise ValueError("No documents were generated because none of the uploaded table levels matched the configured output levels.")
+        raise ValueError("No documents were generated because no supported levels were found.")
     return documents, warnings
 
 
@@ -2033,51 +2460,78 @@ def render_gjp_document_generator() -> None:
         raise RuntimeError("Streamlit is not installed. Run: pip install streamlit")
     st.header("Generate GJP Word Documents")
     st.write(
-        "Upload job title/job code information, specialty mapping Excel files, "
-        "the introduction/work interactions Word file, and one GJP Word template. "
-        "The tool generates a ZIP containing only the levels that have populated "
-        "Responsibility/KSA output tables."
+        "Upload one required GJP Word template and any optional replacement data. "
+        "Only supplied, non-empty content replaces the template; omitted files and "
+        "blank cells leave the corresponding template content unchanged."
+    )
+    department_name = st.text_input(
+        "Department name (optional)",
+        value="",
+        help=(
+            "When no job title/job code workbook is uploaded, this is combined "
+            "with the position name when naming generated documents."
+        ),
     )
     job_info_file = st.file_uploader(
-        "1) Upload job title/job code file (.xlsx)",
+        "1) Optional: upload job title/job code file (.xlsx)",
         type=["xlsx"],
         key="gjp_job_info_xlsx",
     )
     excel_file = st.file_uploader(
-        "2) Upload specialty Excel ZIP or one Excel file (.zip or .xlsx)",
+        "2) Optional: upload specialty Excel ZIP or one Excel file (.zip or .xlsx)",
         type=["zip", "xlsx"],
         key="gjp_level_excel_or_zip",
+        help=(
+            "Each matched Output_<level>..._Resp / Output_<level>..._KSA pair is detected. "
+            "Distinct qualifiers at the same level, such as P5 Senior and P5 Chief, "
+            "generate separate Word documents."
+        ),
     )
     intro_file = st.file_uploader(
-        "3) Upload introduction and interactions (.docx)",
-        type=["docx"],
-        key="intro_interaction_docx",
+        "3) Optional: upload introduction and work interactions (.xlsx)",
+        type=["xlsx"],
+        key="intro_interaction_xlsx",
+        help=(
+            "Use a horizontal table: levels such as D1, P5, P4, P3, P2 in the "
+            "top row; Introduction and Work interactions in the first column."
+        ),
+    )
+    education_file = st.file_uploader(
+        "4) Optional: upload education and work experience (.xlsx)",
+        type=["xlsx"],
+        key="education_work_experience_xlsx",
+        help=(
+            "Use a horizontal table: levels in the top row; Education and "
+            "Work experience in the first column."
+        ),
     )
     template_file = st.file_uploader(
-        "4) Upload GJP Word template (.docx)",
+        "5) Upload GJP Word template (.docx) — required",
         type=["docx"],
         key="gjp_template_docx",
     )
 
     if st.button("Generate GJP Documents", type="primary"):
-        if job_info_file is None or excel_file is None or template_file is None or intro_file is None:
-            st.error(
-                "Please upload the job info Excel, specialty Excel/ZIP file, "
-                "Work Interactions/Introduction Word file, and Word template."
-            )
+        if template_file is None:
+            st.error("Please upload the GJP Word template.")
             return
         try:
             with st.spinner("Generating Word documents..."):
-                job_info_path = _save_uploaded_file(job_info_file, ".xlsx")
-                input_suffix = Path(excel_file.name).suffix.lower()
-                excel_path = _save_uploaded_file(excel_file, input_suffix)
+                job_info_path = _save_uploaded_file(job_info_file, ".xlsx") if job_info_file else None
+                excel_path = None
+                if excel_file:
+                    input_suffix = Path(excel_file.name).suffix.lower()
+                    excel_path = _save_uploaded_file(excel_file, input_suffix)
                 template_path = _save_uploaded_file(template_file, ".docx")
-                intro_path = _save_uploaded_file(intro_file, ".docx")
+                intro_path = _save_uploaded_file(intro_file, ".xlsx") if intro_file else None
+                education_path = _save_uploaded_file(education_file, ".xlsx") if education_file else None
                 documents, warnings = generate_documents(
-                    job_info_path,
-                    excel_path,
-                    template_path,
-                    intro_path,
+                    job_info_path=job_info_path,
+                    excel_or_zip_path=excel_path,
+                    template_path=template_path,
+                    intro_interaction_path=intro_path,
+                    education_work_experience_path=education_path,
+                    department_name=department_name,
                 )
 
             if warnings:
