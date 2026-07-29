@@ -13,11 +13,6 @@ import colorsys
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 
-
-DEFAULT_TEMPLATE_PATH = Path(
-    r"C:\Users\YHUANG43\Desktop\intern_yubo\6.2 Transposing KSA mapping_Theme Version_Investigation - Copy.xlsx"
-)
-
 CLONE_SOURCE_BY_LEVEL = {
     "P-1": "P-2",
     "G-6": "P-2",
@@ -706,25 +701,33 @@ def render_ksa_conversion_tables() -> None:
     import streamlit as st
 
     st.title("KSA Conversion Tables")
+    st.caption("Upload both Excel files. They are processed only for the current browser session.")
 
-    st.sidebar.header("Template")
-    default_template_exists = DEFAULT_TEMPLATE_PATH.exists()
-    use_default_template = st.sidebar.checkbox("Use default first workbook template", value=default_template_exists, disabled=not default_template_exists)
-    template_upload = None
-    if use_default_template:
-        st.sidebar.caption(str(DEFAULT_TEMPLATE_PATH))
-    if not use_default_template:
-        if not default_template_exists:
-            st.sidebar.info("Default template was not found. Upload the formatting template to preserve colors and layout.")
-        template_upload = st.sidebar.file_uploader("Upload first workbook template", type=["xlsx"], key="template")
+    source_upload = st.file_uploader(
+        "1) Upload the Excel workbook to convert",
+        type=["xlsx"],
+        key="ksa_source_workbook",
+        help="Upload the workbook containing the Areas of work and Responsibilities matrix.",
+    )
+    template_upload = st.file_uploader(
+        "2) Upload template: 6.2 Transposing KSA mapping_Theme Version_Investigation.xlsx",
+        type=["xlsx"],
+        key="ksa_template_workbook",
+        help="This template supplies the output worksheets, formulas, colors, and formatting.",
+    )
 
-    source_upload = st.file_uploader("Upload the second workbook / KSA matrix", type=["xlsx"])
-    if source_upload is None:
-        st.info("Upload a workbook like `Env_Economics_KSA_Matrix_Mapped_SpecKSAs.xlsx` to begin.")
+    if source_upload is None or template_upload is None:
+        missing = []
+        if source_upload is None:
+            missing.append("the Excel workbook to convert")
+        if template_upload is None:
+            missing.append("the 6.2 Transposing KSA mapping template")
+        st.info(f"Please upload {' and '.join(missing)} to continue.")
         return
 
     try:
-        source_bytes = source_upload.read()
+        source_bytes = source_upload.getvalue()
+        template_bytes = template_upload.getvalue()
         source_wb = load_workbook(BytesIO(source_bytes), data_only=False)
         matrix_sheets = get_matrix_sheet_names(source_wb)
         if not matrix_sheets:
@@ -752,14 +755,6 @@ def render_ksa_conversion_tables() -> None:
             st.metric(sheet, f"{len(matrix.rows)} responsibilities", f"{len(matrix.ksa_headers)} KSAs")
     if len(matrix_sheets) > 4:
         st.caption(f"{len(matrix_sheets) - 4} additional sheet(s) will also be converted.")
-
-    if use_default_template:
-        template_bytes = DEFAULT_TEMPLATE_PATH.read_bytes()
-    elif template_upload is not None:
-        template_bytes = template_upload.read()
-    else:
-        st.warning("Please provide the first workbook template so the generated workbook keeps the required colors and formatting.")
-        return
 
     if st.button("Generate filled workbook", type="primary"):
         try:
