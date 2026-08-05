@@ -2217,9 +2217,16 @@ def render_word_to_excel():
         accept_multiple_files=True
     )
 
-    template_file = st.file_uploader(
-        "Optional: upload the official GJP Upload template Excel",
-        type=["xlsx"]
+    st.markdown("---")
+    st.header("Generate Job Information Upload Table")
+
+    st.write(
+        "This function extracts job information from all uploaded GJP Word documents and creates the job "
+        "information upload workbook. The output includes GJP Template ID, Status, GJP Area/Workstream, "
+        "English and French job titles and descriptions, Job Code, required years and descriptions of work "
+        "experience, minimum education level, English and French education descriptions, and the mapped "
+        "specialty name. French-language columns currently copy the English content and should be reviewed "
+        "and translated before upload."
     )
 
     if st.button("Generate Excel"):
@@ -2248,7 +2255,7 @@ def render_word_to_excel():
                     st.success(f"Extracted {len(df)} row(s) from {len(docx_files)} document(s).")
                     st.dataframe(df, use_container_width=True)
 
-                    excel_output = fill_template_if_provided(df, template_file)
+                    excel_output = fill_template_if_provided(df, None)
 
                     st.download_button(
                         label="Download generated Excel",
